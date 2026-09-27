@@ -1,0 +1,13 @@
+# Virtual environment & Caches
+.venv/
+__pycache__/
+*.pyc
+model_cache/
+
+# Backup files
+*.old*
+
+# OS / IDE files
+.DS_Store
+.vscode/
+.idea/
