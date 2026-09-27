@@ -12,6 +12,7 @@ import numpy as np
 import config
 from canvas_manager import CanvasManager
 from guesser_model import DrawingGuesser
+from game_state import GameState
 from hand_tracker import GestureState, HandTracker
 
 
@@ -72,6 +73,7 @@ class GuesserWorker(threading.Thread):
         self,
         canvas: CanvasManager,
         prediction_state: PredictionState,
+        game_state: GameState,
         stop_event: threading.Event,
     ) -> None:
         super().__init__(
@@ -80,6 +82,7 @@ class GuesserWorker(threading.Thread):
         )
         self.canvas = canvas
         self.prediction_state = prediction_state
+        self.game_state = game_state
         self.stop_event = stop_event
 
     def run(self) -> None:
@@ -88,6 +91,7 @@ class GuesserWorker(threading.Thread):
                 "Loading AI model in background..."
             )
             guesser = DrawingGuesser()
+            self.game_state.start(list(guesser.labels))
 
             status = "Draw something..."
             if guesser.initialization_warning:
@@ -100,6 +104,8 @@ class GuesserWorker(threading.Thread):
 
             while not self.stop_event.is_set():
                 iteration_started = time.monotonic()
+                _, _, round_id = self.game_state.snapshot()
+                canvas_version = self.canvas.version
 
                 classifier_image = self.canvas.get_classifier_image()
 
@@ -108,10 +114,16 @@ class GuesserWorker(threading.Thread):
                 else:
                     try:
                         predictions = guesser.predict(classifier_image)
-                        self.prediction_state.set_predictions(
-                            predictions,
-                            guesser.backend,
-                        )
+                        if self.canvas.version == canvas_version:
+                            self.prediction_state.set_predictions(
+                                predictions,
+                                guesser.backend,
+                            )
+                            if predictions:
+                                self.game_state.check_guess(
+                                    round_id,
+                                    predictions[0][0],
+                                )
                     except Exception as inference_error:
                         LOGGER.exception("Drawing inference failed")
                         self.prediction_state.set_status(
@@ -140,21 +152,31 @@ class MouseState:
         self.x = -1
         self.y = -1
         self.clear_requested = threading.Event()
-        self.button_rect = (0, 0, 0, 0)
+        self.skip_requested = threading.Event()
+        self.clear_button_rect = (0, 0, 0, 0)
+        self.skip_button_rect = (0, 0, 0, 0)
 
     def update_button_rect(
         self,
         frame_width: int,
         frame_height: int,
     ) -> None:
-        x2 = frame_width - config.CLEAR_BUTTON_MARGIN
+        clear_x2 = frame_width - config.CLEAR_BUTTON_MARGIN
         y2 = frame_height - config.CLEAR_BUTTON_MARGIN
-        x1 = x2 - config.CLEAR_BUTTON_WIDTH
+        clear_x1 = clear_x2 - config.CLEAR_BUTTON_WIDTH
         y1 = y2 - config.CLEAR_BUTTON_HEIGHT
-        self.button_rect = (x1, y1, x2, y2)
+        self.clear_button_rect = (clear_x1, y1, clear_x2, y2)
 
-    def is_over_button(self) -> bool:
-        x1, y1, x2, y2 = self.button_rect
+        skip_x2 = clear_x1 - config.BUTTON_GAP
+        skip_x1 = skip_x2 - config.SKIP_BUTTON_WIDTH
+        self.skip_button_rect = (skip_x1, y1, skip_x2, y2)
+
+    def is_over_clear_button(self) -> bool:
+        x1, y1, x2, y2 = self.clear_button_rect
+        return x1 <= self.x <= x2 and y1 <= self.y <= y2
+
+    def is_over_skip_button(self) -> bool:
+        x1, y1, x2, y2 = self.skip_button_rect
         return x1 <= self.x <= x2 and y1 <= self.y <= y2
 
 
@@ -170,8 +192,11 @@ def mouse_callback(
     userdata.x = x
     userdata.y = y
 
-    if event == cv2.EVENT_LBUTTONDOWN and userdata.is_over_button():
-        userdata.clear_requested.set()
+    if event == cv2.EVENT_LBUTTONDOWN:
+        if userdata.is_over_clear_button():
+            userdata.clear_requested.set()
+        elif userdata.is_over_skip_button():
+            userdata.skip_requested.set()
 
 
 def create_camera() -> cv2.VideoCapture:
@@ -224,6 +249,7 @@ def draw_ui(
     gesture: GestureState,
     pointer: tuple[int, int] | None,
     prediction_state: PredictionState,
+    game_state: GameState,
     mouse_state: MouseState,
 ) -> None:
     height, width = frame.shape[:2]
@@ -242,6 +268,7 @@ def draw_ui(
 
     # Top-Left Prediction Box
     predictions, status, backend = prediction_state.snapshot()
+    target, won, _ = game_state.snapshot()
     p_x1 = config.PANEL_MARGIN
     p_y1 = config.PANEL_MARGIN
     p_x2 = p_x1 + config.PREDICTION_PANEL_WIDTH
@@ -260,7 +287,30 @@ def draw_ui(
         config.FONT_THICKNESS,
     )
 
-    y_offset = p_y1 + 55
+    cv2.putText(
+        frame,
+        f"Draw: {target.title()}",
+        (p_x1 + 10, p_y1 + 55),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (0, 220, 255),
+        2,
+        cv2.LINE_AA,
+    )
+
+    game_message = "You got it! Next drawing soon..." if won else "AI guesses:"
+    cv2.putText(
+        frame,
+        game_message,
+        (p_x1 + 10, p_y1 + 83),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.52,
+        (0, 255, 120) if won else (190, 190, 190),
+        1,
+        cv2.LINE_AA,
+    )
+
+    y_offset = p_y1 + 111
     if predictions:
         for label, prob in predictions:
             text = f"{label.title()}: {prob:.1f}%"
@@ -287,11 +337,11 @@ def draw_ui(
             cv2.LINE_AA,
         )
 
-    # Bottom-Right Clear Button
-    x1, y1, x2, y2 = mouse_state.button_rect
+    # Bottom-right round controls
+    x1, y1, x2, y2 = mouse_state.clear_button_rect
     btn_color = (
         config.CLEAR_BUTTON_HOVER_BGR
-        if mouse_state.is_over_button()
+        if mouse_state.is_over_clear_button()
         else config.CLEAR_BUTTON_BACKGROUND_BGR
     )
     cv2.rectangle(frame, (x1, y1), (x2, y2), btn_color, -1)
@@ -301,6 +351,25 @@ def draw_ui(
         frame,
         "Clear (C)",
         (x1 + 22, y1 + 30),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        config.CLEAR_BUTTON_TEXT_BGR,
+        2,
+        cv2.LINE_AA,
+    )
+
+    skip_x1, skip_y1, skip_x2, skip_y2 = mouse_state.skip_button_rect
+    skip_color = (
+        config.SKIP_BUTTON_HOVER_BGR
+        if mouse_state.is_over_skip_button()
+        else config.SKIP_BUTTON_BACKGROUND_BGR
+    )
+    cv2.rectangle(frame, (skip_x1, skip_y1), (skip_x2, skip_y2), skip_color, -1)
+    cv2.rectangle(frame, (skip_x1, skip_y1), (skip_x2, skip_y2), (255, 255, 255), 1)
+    cv2.putText(
+        frame,
+        "Skip Word",
+        (skip_x1 + 22, skip_y1 + 30),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.6,
         config.CLEAR_BUTTON_TEXT_BGR,
@@ -326,10 +395,11 @@ def main() -> None:
     canvas = CanvasManager(width=width, height=height)
     hand_tracker = HandTracker()
     prediction_state = PredictionState()
+    game_state = GameState()
     mouse_state = MouseState()
 
     stop_event = threading.Event()
-    worker = GuesserWorker(canvas, prediction_state, stop_event)
+    worker = GuesserWorker(canvas, prediction_state, game_state, stop_event)
     worker.start()
 
     cv2.namedWindow(config.WINDOW_NAME)
@@ -347,7 +417,12 @@ def main() -> None:
             gesture = hand_tracker.process_frame(frame)
             pointer = hand_tracker.get_pointer_position()
 
-            if gesture == GestureState.CLEAR or mouse_state.clear_requested.is_set():
+            if mouse_state.skip_requested.is_set():
+                if game_state.skip_round():
+                    canvas.clear()
+                    prediction_state.clear()
+                mouse_state.skip_requested.clear()
+            elif gesture == GestureState.CLEAR or mouse_state.clear_requested.is_set():
                 canvas.clear()
                 prediction_state.clear()
                 mouse_state.clear_requested.clear()
@@ -356,7 +431,25 @@ def main() -> None:
                 canvas.update_pointer(pointer, drawing=is_drawing)
 
             output_frame = overlay_canvas(frame, canvas.get_mask_snapshot())
-            draw_ui(output_frame, gesture, pointer, prediction_state, mouse_state)
+            draw_ui(
+                output_frame,
+                gesture,
+                pointer,
+                prediction_state,
+                game_state,
+                mouse_state,
+            )
+
+            if game_state.should_flash_green(config.WIN_FLASH_SECONDS):
+                green_overlay = np.zeros_like(output_frame)
+                green_overlay[:] = config.WIN_FLASH_COLOR_BGR
+                output_frame = cv2.addWeighted(
+                    output_frame,
+                    1.0 - config.WIN_FLASH_ALPHA,
+                    green_overlay,
+                    config.WIN_FLASH_ALPHA,
+                    0,
+                )
 
             cv2.imshow(config.WINDOW_NAME, output_frame)
 
@@ -364,6 +457,14 @@ def main() -> None:
             if key in config.QUIT_KEYS:
                 break
             elif key in config.CLEAR_KEYS:
+                canvas.clear()
+                prediction_state.clear()
+            elif key in config.SKIP_KEYS:
+                if game_state.skip_round():
+                    canvas.clear()
+                    prediction_state.clear()
+
+            if game_state.advance_if_won(config.ROUND_WIN_DISPLAY_SECONDS):
                 canvas.clear()
                 prediction_state.clear()
 
