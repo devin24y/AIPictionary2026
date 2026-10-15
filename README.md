@@ -37,3 +37,8 @@ Webcam → Hand Tracking → Gesture Recognition → Digital Canvas → AI Guess
 - **MediaPipe** for hand landmark detection
 - **OpenCV** for webcam capture and canvas rendering
 - **AI vision model (via API)** for guessing the drawing
+
+## Acknowledgments
+
+- [MediaPipe](https://developers.google.com/mediapipe) and [OpenCV](https://opencv.org/)
+- hackUMBC 2026 organizers
